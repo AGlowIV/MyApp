@@ -1,0 +1,194 @@
+targetScope = 'subscription'
+
+@description('Deployment location (and RG location).')
+param location string = 'eastus'
+
+@description('Environment name, e.g. dev or prod.')
+@allowed([
+  'dev'
+  'prod'
+])
+param env string = 'dev'
+
+@description('Resource Group name to create/use.')
+param resourceGroupName string
+
+@description('Globally unique prefix (lowercase letters/numbers only). Example: anthonyogana')
+param namePrefix string
+
+@description('Teams/Slack/Logic App webhook URL. Stored in Key Vault, referenced by Function App.')
+@secure()
+param alertWebhookUrl string
+
+@description('Comma-separated list of URLs to check.')
+param urlList string = 'https://www.microsoft.com,https://learn.microsoft.com'
+
+@description('Latency threshold in milliseconds. Alerts if exceeded.')
+param latencyThresholdMs int = 1500
+
+var suffix = toLower(uniqueString(subscription().id, resourceGroupName, env, namePrefix))
+var rgName = resourceGroupName
+
+// resource naming
+var storageName = take('${toLower(replace(namePrefix, '-', ''))}${suffix}sa', 24)
+var kvName = take('${toLower(replace(namePrefix, '-', ''))}-${suffix}-kv', 24) // kv max ~24 chars with hyphens; keep short
+var aiName = '${namePrefix}-${env}-${suffix}-ai'
+var planName = '${namePrefix}-${env}-${suffix}-plan'
+var funcName = take('${namePrefix}-${env}-${suffix}-func', 60)
+
+resource rg 'Microsoft.Resources/resourceGroups@2022-09-01' = {
+  name: rgName
+  location: location
+}
+
+// Storage Account for Functions
+resource storage 'Microsoft.Storage/storageAccounts@2023-01-01' = {
+  scope: rg
+  name: storageName
+  location: location
+  kind: 'StorageV2'
+  sku: {
+    name: 'Standard_LRS'
+  }
+  properties: {
+    minimumTlsVersion: 'TLS1_2'
+    allowBlobPublicAccess: false
+  }
+}
+
+// Application Insights (classic)
+resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
+  scope: rg
+  name: aiName
+  location: location
+  kind: 'web'
+  properties: {
+    Application_Type: 'web'
+  }
+}
+
+// Consumption plan (Linux)
+resource plan 'Microsoft.Web/serverfarms@2022-09-01' = {
+  scope: rg
+  name: planName
+  location: location
+  sku: {
+    name: 'Y1'
+    tier: 'Dynamic'
+  }
+  properties: {
+    reserved: true // Linux
+  }
+}
+
+// Key Vault with access policy for Function App MI (added after MI exists)
+resource kv 'Microsoft.KeyVault/vaults@2023-07-01' = {
+  scope: rg
+  name: kvName
+  location: location
+  properties: {
+    sku: {
+      family: 'A'
+      name: 'standard'
+    }
+    tenantId: subscription().tenantId
+    enabledForDeployment: false
+    enabledForTemplateDeployment: true
+    enabledForDiskEncryption: false
+    enableRbacAuthorization: false
+    accessPolicies: [] // set via separate resource once MI exists
+    networkAcls: {
+      bypass: 'AzureServices'
+      defaultAction: 'Allow'
+    }
+  }
+}
+
+// Secret for webhook
+resource kvSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+  scope: rg
+  name: '${kv.name}/alert-webhook-url'
+  properties: {
+    value: alertWebhookUrl
+  }
+  dependsOn: [
+    kv
+  ]
+}
+
+var storageKey = listKeys(storage.id, storage.apiVersion).keys[0].value
+var storageConn = 'DefaultEndpointsProtocol=https;AccountName=${storage.name};AccountKey=${storageKey};EndpointSuffix=${environment().suffixes.storage}'
+
+// Function App (Linux, Python)
+resource func 'Microsoft.Web/sites@2022-09-01' = {
+  scope: rg
+  name: funcName
+  location: location
+  kind: 'functionapp,linux'
+  identity: {
+    type: 'SystemAssigned'
+  }
+  properties: {
+    serverFarmId: plan.id
+    httpsOnly: true
+    siteConfig: {
+      linuxFxVersion: 'Python|3.11'
+      ftpsState: 'Disabled'
+      minTlsVersion: '1.2'
+      appSettings: [
+        // required function settings
+        { name: 'FUNCTIONS_EXTENSION_VERSION'; value: '~4' }
+        { name: 'FUNCTIONS_WORKER_RUNTIME'; value: 'python' }
+        { name: 'AzureWebJobsStorage'; value: storageConn }
+
+        // telemetry
+        { name: 'APPINSIGHTS_INSTRUMENTATIONKEY'; value: appInsights.properties.InstrumentationKey }
+        { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'; value: appInsights.properties.ConnectionString }
+
+        // project settings
+        { name: 'ENV'; value: env }
+        { name: 'URL_LIST'; value: urlList }
+        { name: 'LATENCY_THRESHOLD_MS'; value: string(latencyThresholdMs) }
+
+        // Key Vault reference (runtime resolves it)
+        { name: 'ALERT_WEBHOOK_URL'; value: '@Microsoft.KeyVault(SecretUri=${kvSecret.properties.secretUriWithVersion})' }
+      ]
+    }
+  }
+  dependsOn: [
+    plan
+    storage
+    appInsights
+    kvSecret
+  ]
+}
+
+// Grant Function App Managed Identity access to Key Vault secret get/list
+resource kvPolicy 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' = {
+  scope: rg
+  name: '${kv.name}/add'
+  properties: {
+    accessPolicies: [
+      {
+        tenantId: subscription().tenantId
+        objectId: func.identity.principalId
+        permissions: {
+          secrets: [
+            'get'
+            'list'
+          ]
+        }
+      }
+    ]
+  }
+  dependsOn: [
+    kv
+    func
+  ]
+}
+
+output resourceGroup string = rgName
+output functionAppName string = func.name
+output keyVaultName string = kv.name
+output appInsightsName string = appInsights.name
+output storageAccountName string = storage.name
