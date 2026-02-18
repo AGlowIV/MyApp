@@ -1,0 +1,20 @@
+azure-url-monitor/
+  infra-bicep/
+    main.bicep
+    main.parameters.dev.json
+    main.parameters.prod.json
+  infra-terraform/
+    main.tf
+    variables.tf
+    outputs.tf
+    versions.tf
+  function/
+    host.json
+    requirements.txt
+    UrlMonitor/__init__.py
+    UrlMonitor/function.json
+  .github/workflows/
+    infra-bicep-deploy.yml
+    app-deploy.yml
+  README.md
+  .gitignore
